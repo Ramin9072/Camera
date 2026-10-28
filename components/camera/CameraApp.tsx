@@ -5,6 +5,7 @@ import { SceneAnalyzer, type Analysis } from "@/lib/ai/SceneAnalyzer";
 import { recommend, type Caps, type Priority } from "@/lib/ai/CameraRecommendationEngine";
 import { SCENES, type Scene } from "@/lib/ai/scenes";
 import ProSettingsPanel from "./ProSettingsPanel";
+import { detect, sceneFromDets, type Det } from "@/lib/ai/ObjectDetector";
 
 const errText = (e: unknown) => {
   const n = (e as { name?: string })?.name;
@@ -33,10 +34,13 @@ export default function CameraApp() {
   const [cloud, setCloud] = useState(false);
   const [shot, setShot] = useState<{ url: string; method: string; w: number; h: number } | null>(null);
   const [msg, setMsg] = useState("");
+  const [dets, setDets] = useState<Det[]>([]);
+  const [soft, setSoft] = useState(1);
+  const [aiState, setAiState] = useState("");
 
   const analyzer = () => (an.current ??= new SceneAnalyzer());
   const refresh = () => { setCaps(mgr.current.caps()); setCur(mgr.current.settings()); };
-  const scene: Scene = override !== "auto" ? override : a?.scene ?? "general";
+  const scene: Scene = override !== "auto" ? override : sceneFromDets(dets) ?? a?.scene ?? "general";
   const plan = useMemo(() => (a ? recommend(a, scene, caps, cur, prio) : null), [a, scene, caps, cur, prio]);
 
   const go = useCallback(async (o: Parameters<CameraManager["start"]>[1] = {}) => {
@@ -61,6 +65,20 @@ export default function CameraApp() {
     document.addEventListener("visibilitychange", vis);
     return () => { live = false; clearInterval(id); document.removeEventListener("visibilitychange", vis); };
   }, [on]);
+  useEffect(() => {
+    if (!on) return;
+    let live = true, run = false;
+    setAiState("Loading object-recognition model (first time only)…");
+    const id = setInterval(async () => {
+      const v = vref.current;
+      if (run || document.hidden || !v || !v.videoWidth) return;
+      run = true;
+      try { const d = await detect(v); if (live) { setDets(d); setAiState(""); } }
+      catch { if (live) setAiState("Object recognition unavailable (model download failed); using basic detection only."); }
+      finally { run = false; }
+    }, 1500);
+    return () => { live = false; clearInterval(id); };
+  }, [on]);
   useEffect(() => { const m = mgr.current; return () => m.stop(); }, []);
 
   const optimize = async () => {
@@ -69,14 +87,22 @@ export default function CameraApp() {
     try {
       const fresh = await analyzer().analyze(vref.current);
       if (!fresh) { setMsg("Preview is not ready yet."); return; }
-      const m = mgr.current, sc = override !== "auto" ? override : fresh.scene;
+      const m = mgr.current, sc = override !== "auto" ? override : sceneFromDets(dets) ?? fresh.scene;
       const p = recommend(fresh, sc, m.caps(), m.settings(), prio);
       const want: Record<string, unknown> = {};
       p.recs.forEach((r) => { if (r.auto) want[r.key] = r.value; });
       const res = await m.apply(want);
       setResults(res); refresh();
+      const hw = Object.entries(res).some(([k, r]) => ["exposureCompensation", "exposureTime", "iso"].includes(k) && r.status === "confirmed");
+      let extra = "";
+      if (hw) setSoft(1);
+      else if (fresh.luma < 85 || fresh.luma > 170) {
+        const f = Math.min(2, Math.max(0.6, 115 / Math.max(fresh.luma, 1)));
+        setSoft(Number(f.toFixed(2)));
+        extra = ` This camera cannot change exposure in hardware, so software brightness x${f.toFixed(2)} was applied (preview and saved photo only, not the sensor).`;
+      }
       const ok = Object.values(res).filter((r) => r.status === "confirmed").length, total = Object.keys(res).length;
-      setMsg(total === 0 ? "This camera exposes nothing the engine could change; see advice in Pro." : `${ok}/${total} changes confirmed by read-back.`);
+      setMsg((total === 0 ? "This camera exposes no hardware setting to change." : `${ok}/${total} hardware changes confirmed by read-back.`) + extra);
       await sleep(600);
       const again = await analyzer().analyze(vref.current); if (again) setA(again);
     } finally { setBusy(false); }
@@ -92,7 +118,7 @@ export default function CameraApp() {
 
   const capture = async () => {
     if (!vref.current || !on) return;
-    try { const s = await mgr.current.capture(vref.current); setShot({ url: URL.createObjectURL(s.blob), method: s.method, w: s.w, h: s.h }); }
+    try { const s = await mgr.current.capture(vref.current, soft); setShot({ url: URL.createObjectURL(s.blob), method: s.method, w: s.w, h: s.h }); }
     catch (e) { setMsg(`Capture failed: ${(e as Error).message}`); }
   };
   const retake = () => { if (shot) URL.revokeObjectURL(shot.url); setShot(null); };
@@ -115,7 +141,7 @@ export default function CameraApp() {
   const light = !a ? "…" : a.lowLight ? "Low light" : a.luma > 190 ? "Very bright" : a.luma > 120 ? "Bright" : "Moderate";
   return (
     <main className="fixed inset-0 bg-black text-white">
-      <video ref={vref} playsInline muted className="h-full w-full object-cover" />
+      <video ref={vref} playsInline muted className="h-full w-full object-cover" style={{ filter: soft !== 1 ? `brightness(${soft})` : undefined }} />
       {!on && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/90 p-6 text-center">
           <h1 className="text-2xl font-semibold">AI Pro Camera</h1>
@@ -128,11 +154,22 @@ export default function CameraApp() {
       {on && (
         <>
           <div className="absolute inset-x-0 top-0 flex flex-wrap items-center gap-2 bg-gradient-to-b from-black/70 p-3 pt-[max(0.75rem,env(safe-area-inset-top))] text-xs">
-            <span className="rounded-full bg-white/20 px-3 py-1 capitalize">{scene}{override === "auto" && a ? ` · ${Math.round(a.confidence * 100)}%` : " · manual"}</span>
+            <span className="rounded-full bg-white/20 px-3 py-1 capitalize">{scene}{override !== "auto" ? " · manual" : sceneFromDets(dets) ? " · recognised objects" : a ? ` · ${Math.round(a.confidence * 100)}%` : ""}</span>
             <span className="rounded-full bg-white/20 px-3 py-1">{light}</span>
             <span className="rounded-full bg-white/20 px-3 py-1">{cur.width}×{cur.height}</span>
+            {dets.length > 0 && <span className="rounded-full bg-emerald-600/70 px-3 py-1">Detected: {[...new Set(dets.map((d) => d.cls))].join(", ")}</span>}
+            {override !== "auto" && override !== "portrait" && sceneFromDets(dets) === "portrait" && <button className="rounded-full bg-sky-500 px-3 py-1" onClick={() => setOverride("portrait")}>Person detected: use Portrait</button>}
           </div>
+          {aiState && <p className="absolute inset-x-0 top-24 mx-auto w-fit max-w-[90%] rounded bg-black/70 px-3 py-1 text-xs">{aiState}</p>}
           {msg && <p role="status" className="absolute inset-x-0 top-14 mx-auto w-fit max-w-[90%] rounded bg-black/70 px-3 py-1 text-xs">{msg}</p>}
+          <div className="absolute inset-x-0 bottom-28 space-y-2 px-4 text-xs">
+            <label className="flex items-center gap-2 rounded-full bg-black/50 px-3 py-1">Light (software)
+              <input type="range" aria-label="Software brightness" className="flex-1" min={0.5} max={2} step={0.05} value={soft} onChange={(e) => setSoft(Number(e.target.value))} />x{soft.toFixed(2)}</label>
+            <div className="flex gap-2 overflow-x-auto">
+              {devs.map((d, i) => <button key={d.deviceId} onClick={() => go({ deviceId: d.deviceId })} className={`max-w-[10rem] shrink-0 truncate rounded-full px-3 py-1 ${d.deviceId === cur.deviceId ? "bg-white text-black" : "bg-white/20"}`}>{d.label || `Camera ${i + 1}`}</button>)}
+              {devs.length < 2 && <span className="rounded-full bg-black/50 px-3 py-1 text-white/70">Only one camera/lens is exposed by this browser and device.</span>}
+            </div>
+          </div>
           <div className="absolute inset-x-0 bottom-0 flex items-center justify-around bg-gradient-to-t from-black/80 p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
             <button className="rounded-full bg-white/15 px-4 py-3 text-sm" onClick={() => setPro(true)}>Pro</button>
             <button aria-label="Capture photo" className="h-16 w-16 rounded-full border-4 border-white bg-white/90" onClick={capture} />

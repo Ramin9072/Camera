@@ -60,9 +60,9 @@ export class CameraManager {
     return out;
   }
 
-  async capture(video: HTMLVideoElement) {
+  async capture(video: HTMLVideoElement, brightness = 1) {
     const IC = (window as any).ImageCapture;
-    if (IC && this.track) {
+    if (IC && this.track && brightness === 1) {
       try {
         const blob: Blob = await new IC(this.track).takePhoto();
         const bmp = await createImageBitmap(blob);
@@ -71,8 +71,14 @@ export class CameraManager {
     }
     const c = document.createElement("canvas");
     c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext("2d")?.drawImage(video, 0, 0);
+    const cx = c.getContext("2d");
+    cx?.drawImage(video, 0, 0);
+    if (cx && brightness !== 1) { // software brightness, applied to pixels (not the sensor)
+      const im = cx.getImageData(0, 0, c.width, c.height), p = im.data;
+      for (let i = 0; i < p.length; i += 4) { p[i] *= brightness; p[i + 1] *= brightness; p[i + 2] *= brightness; }
+      cx.putImageData(im, 0, 0);
+    }
     const blob = await new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("Encoding failed"))), "image/jpeg", 0.95));
-    return { blob, method: "Canvas frame grab (preview-stream resolution, not full sensor)", w: c.width, h: c.height };
+    return { blob, method: brightness !== 1 ? "Canvas frame grab + software brightness (preview resolution)" : "Canvas frame grab (preview-stream resolution, not full sensor)", w: c.width, h: c.height };
   }
 }
